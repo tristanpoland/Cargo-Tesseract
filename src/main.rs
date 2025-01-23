@@ -4,18 +4,48 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use walkdir::WalkDir;
 use std::path::{Path, PathBuf};
 use std::io;
+use std::time::Duration;
 use serde::{Serialize, Deserialize};
 use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
 use std::sync::Arc;
-use std::time::Duration;
 use colored::*;
 
-/// Sanitizes and validates file paths
+#[derive(Serialize, Deserialize, Debug)]
+struct BuildUnit {
+    package_name: String,
+    dependencies: Vec<String>,
+    source_files: Vec<PathBuf>,
+    artifacts: Vec<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum BuildRequest {
+    BuildUnit {
+        unit: BuildUnit,
+        release: bool,
+    },
+    TransferArtifact {
+        from_unit: String,
+        artifact_path: PathBuf,
+    },
+    Heartbeat
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum BuildResponse {
+    BuildComplete {
+        unit_name: String,
+        artifacts: Vec<(PathBuf, Vec<u8>)>,
+    },
+    BuildError {
+        unit_name: String,
+        error: String,
+    },
+    HeartbeatAck
+}
+
 fn sanitize_path(original_path: &Path) -> Result<PathBuf, io::Error> {
-    // Convert to absolute path
     let base_dir = std::env::current_dir()?;
-    
-    // Sanitize filename
     let clean_filename = original_path
         .file_name()
         .map(|name| name.to_string_lossy())
@@ -26,7 +56,6 @@ fn sanitize_path(original_path: &Path) -> Result<PathBuf, io::Error> {
         )
         .unwrap_or_else(|| "unknown_file".to_string());
     
-    // Construct a safe path
     let relative_path = original_path
         .strip_prefix(&base_dir)
         .unwrap_or(original_path);
@@ -36,50 +65,21 @@ fn sanitize_path(original_path: &Path) -> Result<PathBuf, io::Error> {
         .map(|parent| parent.join(&clean_filename))
         .unwrap_or_else(|| base_dir.join(&clean_filename));
     
-    // Canonicalize to resolve any remaining path issues
     safe_path.canonicalize()
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-enum BuildRequest {
-    StartBuild { 
-        package_name: String,
-        release: bool 
-    },
-    UploadSource {
-        path: String,
-        data: Vec<u8>
-    },
-    DownloadArtifact {
-        path: String
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum BuildResponse {
-    BuildStarted,
-    BuildComplete { success: bool },
-    BuildError { message: String },
-    ArtifactData { data: Vec<u8> }
-}
-
-/// Filters files to be uploaded, excluding common build and VCS directories
 fn should_upload_file(path: &Path) -> bool {
     let ignored_dirs = [
-        ".git", ".gitignore", 
-        "target", "node_modules", 
-        ".cargo", ".vscode", 
-        ".idea"
+        ".git", ".gitignore", "target", "node_modules", 
+        ".cargo", ".vscode", ".idea", "builds"
     ];
 
     let path_str = path.to_string_lossy();
     !ignored_dirs.iter().any(|&dir| path_str.contains(dir)) &&
     path.is_file() &&
-    // Limit file size to prevent overwhelming transfer
     !path.metadata().map(|m| m.len() > 50_000_000).unwrap_or(false)
 }
 
-/// Creates a styled progress bar
 fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
     let pb = ProgressBar::new(len);
     pb.set_style(ProgressStyle::default_bar()
@@ -89,161 +89,129 @@ fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
     pb
 }
 
+async fn send_request(stream: &mut TcpStream, request: &BuildRequest) -> Result<BuildResponse, io::Error> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let data = bincode::serialize(request).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let len = (data.len() as u32).to_be_bytes();
+        stream.write_all(&len).await?;
+        stream.write_all(&data).await?;
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut buf: Vec<u8> = vec![0; len];
+        stream.read_exact(&mut buf).await?;
+        bincode::deserialize::<BuildResponse>(&buf).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Request timed out"))?
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse command-line arguments
     let matches = Command::new("cargo-tess")
         .bin_name("cargo")
         .subcommand(
             Command::new("tess")
-                .arg(
-                    Arg::new("node")
-                        .short('n')
-                        .long("node")
-                        .help("Address of any node in cluster (host:port)")
-                        .default_value("localhost:9876")
-                )
-                .arg(
-                    Arg::new("release")
-                        .long("release")
-                        .help("Build with release profile")
-                )
-                .arg(
-                    Arg::new("verbose")
-                        .short('v')
-                        .long("verbose")
-                        .help("Enable verbose logging")
-                )
-        )
+                .arg(Arg::new("node")
+                    .short('n')
+                    .long("node")
+                    .help("Address of any node in cluster (host:port)")
+                    .default_value("localhost:9876"))
+                .arg(Arg::new("release")
+                    .long("release")
+                    .help("Build with release profile"))
+                .arg(Arg::new("verbose")
+                    .short('v')
+                    .long("verbose")
+                    .help("Enable verbose logging")))
         .get_matches();
 
-    // Exit if not the tess subcommand
     let Some(matches) = matches.subcommand_matches("tess") else {
         println!("Use 'cargo tess' to run the distributed build.");
         return Ok(());
     };
 
-    // Configuration
     let node = matches.get_one::<String>("node").unwrap();
     let release = matches.contains_id("release");
-    let verbose = matches.contains_id("verbose");
 
-    // Prepare connection
     println!("{}", "🔌 Connecting to build cluster...".green());
     let mut stream = TcpStream::connect(node).await?;
+    stream.set_nodelay(true)?;
 
-    // Collect files to upload
-    let files: Vec<_> = WalkDir::new(".")
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|entry| should_upload_file(entry.path()))
-        .collect();
+    // Read cargo manifest
+let metadata = cargo_metadata::MetadataCommand::new().exec()?;
+let package = metadata.root_package().ok_or("No package found")?;
 
-    // Multiprogressbar for upload
-    let multi_progress = Arc::new(MultiProgress::new());
-    let overall_pb = multi_progress.add(create_progress_bar(
-        files.iter().map(|f| f.metadata().unwrap().len()).sum(), 
-        "Uploading source files"
-    ));
+// Create tarball of source files
+let temp_dir = tempfile::tempdir()?;
+let tar_path = temp_dir.path().join("source.tar.gz");
+let file = std::fs::File::create(&tar_path)?;
+let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+let mut tar = tar::Builder::new(enc);
 
-    // Upload source files with progress tracking
-    println!("{}", "📤 Preparing to upload source files...".yellow());
-    for entry in files {
-        let data = tokio::fs::read(entry.path()).await?;
-        
-        // Use sanitized path
-        let sanitized_path = match sanitize_path(entry.path()) {
-            Ok(path) => path.to_string_lossy().to_string(),
-            Err(e) => {
-                eprintln!("Path sanitization error: {}", e);
-                continue;
-            }
-        };
+let files: Vec<_> = WalkDir::new(".")
+    .into_iter()
+    .filter_map(|e| e.ok())
+    .filter(|entry| should_upload_file(entry.path()))
+    .collect();
 
-        let request = BuildRequest::UploadSource {
-            path: sanitized_path,
-            data,
-        };
+let overall_pb = create_progress_bar(
+    files.iter().map(|f| f.metadata().unwrap().len()).sum(), 
+    "Preparing source files"
+);
 
-        // Serialize and send request
-        stream.write_all(&bincode::serialize(&request)?).await?;
-        
-        // Read response
-        let mut buf = vec![0; 1024];
-        let n = stream.read(&mut buf).await?;
-        let response: BuildResponse = bincode::deserialize(&buf[..n])?;
-        
-        // Handle potential upload errors
-        if let BuildResponse::BuildError { message } = response {
-            eprintln!("{} {}: {}", 
-                "❌ Failed to upload".red(), 
-                entry.path().display(), 
-                message
-            );
-            return Ok(());
-        }
+for entry in &files {
+    let path = entry.path();
+    tar.append_path_with_name(path, path.strip_prefix("./").unwrap_or(path))?;
+    overall_pb.inc(entry.metadata().unwrap().len());
+}
 
-        // Update progress bar
-        overall_pb.inc(entry.metadata().unwrap().len());
-    }
-    overall_pb.finish_with_message("✨ Upload complete");
+tar.finish()?;
+overall_pb.finish_with_message("✨ Source files prepared");
 
-    // Start build
-    println!("{}", "🚀 Starting distributed build...".green());
-    let request = BuildRequest::StartBuild {
-        package_name: env!("CARGO_PKG_NAME").to_string(),
-        release,
-    };
-    stream.write_all(&bincode::serialize(&request)?).await?;
+let unit = BuildUnit {
+    package_name: package.name.clone(),
+    dependencies: package.dependencies.iter().map(|d| d.name.clone()).collect(),
+    source_files: files.iter().map(|f| f.path().to_path_buf()).collect(),
+    artifacts: package.targets.iter().map(|t| PathBuf::from(&t.name)).collect(),
+};
 
-    // Build progress tracking
+println!("{}", "🚀 Starting distributed build...".green());
+let request = BuildRequest::BuildUnit { unit, release };
+let response = send_request(&mut stream, &request).await?;
+
     let build_pb = create_progress_bar(100, "Building project");
     build_pb.enable_steady_tick(120);
 
-    // Read build response
-    let mut buf = vec![0; 1024 * 1024];
-    let n = stream.read(&mut buf).await?;
-    match bincode::deserialize(&buf[..n])? {
-        BuildResponse::BuildComplete { success } => {
-            if !success {
-                build_pb.finish_with_message("❌ Build failed");
-                eprintln!("{}", "Build process encountered errors".red());
-                return Ok(());
-            }
+    match response {
+        BuildResponse::BuildComplete { unit_name, artifacts } => {
             build_pb.finish_with_message("✅ Build successful");
-        },
-        BuildResponse::BuildError { message } => {
-            build_pb.finish_with_message("❌ Build failed");
-            eprintln!("{}: {}", "Build error".red(), message);
-            return Ok(());
-        },
-        _ => {}
-    }
+            println!("{}", "📥 Downloading artifacts...".yellow());
 
-    // Download artifacts
-    println!("{}", "📥 Downloading build artifacts...".yellow());
-    let request = BuildRequest::DownloadArtifact {
-        path: "target".to_string()
-    };
-    stream.write_all(&bincode::serialize(&request)?).await?;
+            let artifacts_pb = create_progress_bar(
+                artifacts.iter().map(|(_, data)| data.len() as u64).sum(), 
+                "Downloading artifacts"
+            );
 
-    // Artifact download progress
-    let artifact_pb = create_progress_bar(1024 * 1024, "Downloading artifacts");
+            for (path, data) in artifacts {
+                let target_path = std::env::current_dir()?.join("target")
+                    .join(if release { "release" } else { "debug" })
+                    .join(path);
 
-    // Read artifact response
-    let n = stream.read(&mut buf).await?;
-    match bincode::deserialize(&buf[..n])? {
-        BuildResponse::ArtifactData { data } => {
-            // Use standard path handling
-            let target_dir = std::env::current_dir()?.join("target");
-            std::fs::create_dir_all(&target_dir)?;
-            tokio::fs::write(target_dir.join("artifacts.tar.gz"), data).await?;
-            artifact_pb.finish_with_message("✨ Artifacts downloaded successfully!");
+                if let Some(parent) = target_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let data_len = data.len() as u64;
+                tokio::fs::write(&target_path, data).await?;
+                artifacts_pb.inc(data_len);
+            }
+
+            artifacts_pb.finish_with_message("✨ Artifacts downloaded successfully!");
             println!("{}", "Build process complete! 🎉".green());
         },
-        BuildResponse::BuildError { message } => {
-            artifact_pb.finish_with_message("❌ Artifact download failed");
-            eprintln!("{}: {}", "Artifact download error".red(), message);
+        BuildResponse::BuildError { unit_name, error } => {
+            build_pb.finish_with_message("❌ Build failed");
+            eprintln!("{}: {} - {}", "Build error".red(), unit_name, error);
         },
         _ => {}
     }
