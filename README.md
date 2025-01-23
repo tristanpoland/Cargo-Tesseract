@@ -36,15 +36,6 @@ For release builds:
 cargo tess --node build.example.com:9876 --release
 ```
 
-## 🌟 Performance
-
-Remote builds can significantly reduce compilation times by utilizing powerful server hardware:
-
-| CPU              | Build Time (Large Project) |
-|------------------|---------------------------|
-| M1 MacBook Air   | 25m                      |
-| 32-core Builder  | 4m 30s                   |
-
 ## 🔒 Security
 
 - Secure TCP connections

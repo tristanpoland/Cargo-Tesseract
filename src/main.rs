@@ -6,8 +6,7 @@ use std::path::{Path, PathBuf};
 use std::io;
 use std::time::Duration;
 use serde::{Serialize, Deserialize};
-use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
-use std::sync::Arc;
+use indicatif::{ProgressBar, ProgressStyle};
 use colored::*;
 
 #[derive(Serialize, Deserialize, Debug)]
