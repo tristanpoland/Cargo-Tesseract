@@ -2,7 +2,7 @@
 name = "cargo-tess"
 description = "A cargo subcommand to build your project on a remote tesseract server"
 license = "MIT"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
