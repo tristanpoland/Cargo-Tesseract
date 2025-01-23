@@ -100,9 +100,9 @@ async fn send_request(stream: &mut TcpStream, request: &BuildRequest) -> Result<
         stream.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
 
-        let mut buf: Vec<u8> = vec![0; len];
+        let mut buf = vec![0; len];
         stream.read_exact(&mut buf).await?;
-        bincode::deserialize::<BuildResponse>(&buf).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Request timed out"))?
 }
 
@@ -138,47 +138,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect(node).await?;
     stream.set_nodelay(true)?;
 
+    // Send initial heartbeat
+    let heartbeat = BuildRequest::Heartbeat;
+    let response = send_request(&mut stream, &heartbeat).await?;
+    match response {
+        BuildResponse::HeartbeatAck => {},
+        _ => return Err("Failed to connect to build cluster".into())
+    }
+
     // Read cargo manifest
-let metadata = cargo_metadata::MetadataCommand::new().exec()?;
-let package = metadata.root_package().ok_or("No package found")?;
+    let metadata = cargo_metadata::MetadataCommand::new().exec()?;
+    let package = metadata.root_package().ok_or("No package found")?;
 
-// Create tarball of source files
-let temp_dir = tempfile::tempdir()?;
-let tar_path = temp_dir.path().join("source.tar.gz");
-let file = std::fs::File::create(&tar_path)?;
-let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-let mut tar = tar::Builder::new(enc);
+    // Create tarball of source files
+    let temp_dir = tempfile::tempdir()?;
+    let tar_path = temp_dir.path().join("source.tar.gz");
+    let file = std::fs::File::create(&tar_path)?;
+    let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut tar = tar::Builder::new(enc);
 
-let files: Vec<_> = WalkDir::new(".")
-    .into_iter()
-    .filter_map(|e| e.ok())
-    .filter(|entry| should_upload_file(entry.path()))
-    .collect();
+    let files: Vec<_> = WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|entry| should_upload_file(entry.path()))
+        .collect();
 
-let overall_pb = create_progress_bar(
-    files.iter().map(|f| f.metadata().unwrap().len()).sum(), 
-    "Preparing source files"
-);
+    let overall_pb = create_progress_bar(
+        files.iter().map(|f| f.metadata().unwrap().len()).sum(), 
+        "Preparing source files"
+    );
 
-for entry in &files {
-    let path = entry.path();
-    tar.append_path_with_name(path, path.strip_prefix("./").unwrap_or(path))?;
-    overall_pb.inc(entry.metadata().unwrap().len());
-}
+    for entry in &files {
+        let path = entry.path();
+        tar.append_path_with_name(path, path.strip_prefix("./").unwrap_or(path))?;
+        overall_pb.inc(entry.metadata().unwrap().len());
+    }
 
-tar.finish()?;
-overall_pb.finish_with_message("✨ Source files prepared");
+    tar.finish()?;
+    overall_pb.finish_with_message("✨ Source files prepared");
 
-let unit = BuildUnit {
-    package_name: package.name.clone(),
-    dependencies: package.dependencies.iter().map(|d| d.name.clone()).collect(),
-    source_files: files.iter().map(|f| f.path().to_path_buf()).collect(),
-    artifacts: package.targets.iter().map(|t| PathBuf::from(&t.name)).collect(),
-};
+    let unit = BuildUnit {
+        package_name: package.name.clone(),
+        dependencies: package.dependencies.iter().map(|d| d.name.clone()).collect(),
+        source_files: files.iter().map(|f| f.path().to_path_buf()).collect(),
+        artifacts: package.targets.iter().map(|t| PathBuf::from(&t.name)).collect(),
+    };
 
-println!("{}", "🚀 Starting distributed build...".green());
-let request = BuildRequest::BuildUnit { unit, release };
-let response = send_request(&mut stream, &request).await?;
+    println!("{}", "🚀 Starting distributed build...".green());
+    let request = BuildRequest::BuildUnit { unit, release };
+    let response = send_request(&mut stream, &request).await?;
 
     let build_pb = create_progress_bar(100, "Building project");
     build_pb.enable_steady_tick(120);
@@ -213,7 +221,7 @@ let response = send_request(&mut stream, &request).await?;
             build_pb.finish_with_message("❌ Build failed");
             eprintln!("{}: {} - {}", "Build error".red(), unit_name, error);
         },
-        _ => {}
+        _ => eprintln!("Unexpected response from build cluster")
     }
 
     Ok(())
