@@ -68,13 +68,16 @@ fn sanitize_path(original_path: &Path) -> Result<PathBuf, io::Error> {
 }
 
 fn should_upload_file(path: &Path) -> bool {
-    let ignored_dirs = [
-        ".git", ".gitignore", "target", "node_modules", 
-        ".cargo", ".vscode", ".idea", "builds"
+    let ignored_patterns = [
+        ".git", ".gitignore", ".dockerignore",
+        "target", "node_modules", 
+        ".cargo", ".vscode", ".idea", "builds",
+        "Dockerfile", "docker-compose.yml"
     ];
 
     let path_str = path.to_string_lossy();
-    !ignored_dirs.iter().any(|&dir| path_str.contains(dir)) &&
+    !ignored_patterns.iter().any(|&pattern| path_str.contains(pattern)) &&
+    path.extension().map_or(false, |ext| ext == "rs") &&  // Only Rust files
     path.is_file() &&
     !path.metadata().map(|m| m.len() > 50_000_000).unwrap_or(false)
 }
