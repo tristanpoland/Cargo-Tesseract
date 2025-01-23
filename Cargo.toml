@@ -1,5 +1,7 @@
 [package]
 name = "cargo-tess"
+description = "A cargo subcommand to build your project on a remote tesseract server"
+license = "MIT"
 version = "0.1.0"
 edition = "2021"
 
