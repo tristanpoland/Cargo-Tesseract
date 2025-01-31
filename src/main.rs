@@ -142,7 +142,17 @@ impl TesseractClient {
     }
 
     fn create_tarball(unit: &BuildUnit) -> Result<Vec<u8>> {
-        let root_dir = unit.source_files
+        // Find both workspace root and package root
+        let workspace_root = unit.source_files
+            .iter()
+            .find_map(|path| {
+                path.ancestors()
+                    .find(|dir| dir.join("Cargo.toml").exists())
+                    .map(|dir| dir.to_path_buf())
+            })
+            .ok_or_else(|| anyhow::anyhow!("Could not find workspace root"))?;
+
+        let package_root = unit.source_files
             .iter()
             .find_map(|path| {
                 let mut current = path.parent()?;
@@ -154,50 +164,61 @@ impl TesseractClient {
                 }
                 None
             })
-            .ok_or_else(|| anyhow::anyhow!("Could not find directory containing Cargo.toml"))?;
+            .ok_or_else(|| anyhow::anyhow!("Could not find package root"))?;
 
-        info!("Creating tarball from root directory: {}", root_dir.display());
-        
+        info!("Creating tarball:");
+        info!("Workspace root: {}", workspace_root.display());
+        info!("Package root: {}", package_root.display());
+
         let mut tarball = Vec::new();
         let encoder = GzEncoder::new(&mut tarball, Compression::default());
         let mut tar = Builder::new(encoder);
 
-        // Add Cargo.toml and workspace files
-        let cargo_toml_path = root_dir.join("Cargo.toml");
-        if cargo_toml_path.exists() {
-            let relative_path = cargo_toml_path.strip_prefix(&root_dir)?;
-            info!("Adding to tarball: {}", relative_path.display());
-            tar.append_path_with_name(&cargo_toml_path, relative_path)?;
-        }
-
-        let cargo_lock_path = root_dir.join("Cargo.lock");
-        if cargo_lock_path.exists() {
-            let relative_path = cargo_lock_path.strip_prefix(&root_dir)?;
-            info!("Adding to tarball: {}", relative_path.display());
-            tar.append_path_with_name(&cargo_lock_path, relative_path)?;
-        }
-
-        // Add source files
-        for source_path in &unit.source_files {
-            if source_path.exists() {
-                let relative_path = source_path.strip_prefix(&root_dir)?;
-                info!("Adding source file: {}", relative_path.display());
-                tar.append_path_with_name(source_path, relative_path)?;
+        // Helper to add files with correct relative paths
+        let mut add_file = |path: &Path| -> Result<()> {
+            if !path.exists() {
+                return Ok(());
             }
+
+            // Calculate relative path from workspace root
+            let relative_path = if path.starts_with(&workspace_root) {
+                path.strip_prefix(&workspace_root)?
+            } else {
+                path.file_name()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?
+                    .as_ref()
+            };
+
+            info!("Adding file: {} as {}", path.display(), relative_path.display());
+            tar.append_path_with_name(path, relative_path)?;
+            Ok(())
+        };
+
+        // Add workspace files
+        add_file(&workspace_root.join("Cargo.toml"))?;
+        add_file(&workspace_root.join("Cargo.lock"))?;
+
+        // Add package files
+        let package_dir_name = package_root.file_name()
+            .ok_or_else(|| anyhow::anyhow!("Invalid package directory name"))?;
+        
+        // Add package manifest with correct relative path
+        let package_relative = package_root.strip_prefix(&workspace_root)?;
+        add_file(&package_root.join("Cargo.toml"))?;
+
+        // Add all source files
+        for source_path in &unit.source_files {
+            add_file(source_path)?;
         }
 
-        // Add workspace files if they exist
-        let workspace_root = root_dir.ancestors()
-            .find(|dir| dir.join("Cargo.toml").exists())
-            .unwrap_or(&root_dir);
-            
-        if workspace_root != &root_dir {
-            Self::add_file(&workspace_root.join("Cargo.toml"), &mut tar)?;
-            Self::add_file(&workspace_root.join("Cargo.lock"), &mut tar)?;
+        // Add .cargo/config.toml if it exists
+        let cargo_config = workspace_root.join(".cargo").join("config.toml");
+        if cargo_config.exists() {
+            add_file(&cargo_config)?;
         }
 
         tar.finish()?;
-        drop(tar.into_inner()?);
+        drop(tar);
         Ok(tarball)
     }
 
