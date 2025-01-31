@@ -3,14 +3,15 @@ use cargo_metadata::MetadataCommand;
 use clap::Parser;
 use colored::*;
 use flate2::{write::GzEncoder, Compression};
-use serde::{Serialize, Deserialize};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use tar::Builder;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -19,6 +20,14 @@ use tokio::{
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::{FmtSubscriber};
 use walkdir::WalkDir;
+
+#[derive(Parser, Debug)]
+#[command(name = "cargo")]
+#[command(bin_name = "cargo")]
+enum Cargo {
+    #[command(name = "tess")]
+    Tesseract(CliArgs),
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -31,7 +40,7 @@ struct CliArgs {
     #[arg(short, long)]
     release: bool,
 
-    /// Target triple
+    /// Target triple (e.g., x86_64-pc-windows-msvc)
     #[arg(short, long)]
     target: Option<String>,
 
@@ -122,12 +131,13 @@ impl TesseractClient {
     fn create_progress_bar(&self, msg: &str) -> ProgressBar {
         let pb = self.multi_progress.add(ProgressBar::new(100));
         pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{msg} {bar:40.cyan/blue} {spinner}")
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} {msg}")
                 .unwrap()
-                .progress_chars("=> "),
+                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
         );
         pb.set_message(msg.to_string());
+        pb.enable_steady_tick(Duration::from_millis(100));
         pb
     }
 
@@ -146,40 +156,58 @@ impl TesseractClient {
             })
             .ok_or_else(|| anyhow::anyhow!("Could not find directory containing Cargo.toml"))?;
 
+        info!("Creating tarball from root directory: {}", root_dir.display());
+        
         let mut tarball = Vec::new();
         let encoder = GzEncoder::new(&mut tarball, Compression::default());
-        let mut tar = tar::Builder::new(encoder);
+        let mut tar = Builder::new(encoder);
 
-        // Add Cargo.toml and Cargo.lock from root
-        let mut add_file = |path: &Path| -> Result<()> {
-            if path.exists() {
-                let relative_path = path.strip_prefix(&root_dir)?;
-                tar.append_path_with_name(path, relative_path)?;
-            }
-            Ok(())
-        };
+        // Add Cargo.toml and workspace files
+        let cargo_toml_path = root_dir.join("Cargo.toml");
+        if cargo_toml_path.exists() {
+            let relative_path = cargo_toml_path.strip_prefix(&root_dir)?;
+            info!("Adding to tarball: {}", relative_path.display());
+            tar.append_path_with_name(&cargo_toml_path, relative_path)?;
+        }
 
-        add_file(&root_dir.join("Cargo.toml"))?;
-        add_file(&root_dir.join("Cargo.lock"))?;
+        let cargo_lock_path = root_dir.join("Cargo.lock");
+        if cargo_lock_path.exists() {
+            let relative_path = cargo_lock_path.strip_prefix(&root_dir)?;
+            info!("Adding to tarball: {}", relative_path.display());
+            tar.append_path_with_name(&cargo_lock_path, relative_path)?;
+        }
 
         // Add source files
         for source_path in &unit.source_files {
-            add_file(source_path)?;
+            if source_path.exists() {
+                let relative_path = source_path.strip_prefix(&root_dir)?;
+                info!("Adding source file: {}", relative_path.display());
+                tar.append_path_with_name(source_path, relative_path)?;
+            }
         }
 
         // Add workspace files if they exist
         let workspace_root = root_dir.ancestors()
             .find(|dir| dir.join("Cargo.toml").exists())
             .unwrap_or(&root_dir);
-
+            
         if workspace_root != &root_dir {
-            add_file(&workspace_root.join("Cargo.toml"))?;
-            add_file(&workspace_root.join("Cargo.lock"))?;
+            Self::add_file(&workspace_root.join("Cargo.toml"), &mut tar)?;
+            Self::add_file(&workspace_root.join("Cargo.lock"), &mut tar)?;
         }
 
         tar.finish()?;
         drop(tar.into_inner()?);
         Ok(tarball)
+    }
+
+    fn add_file(path: &Path, tar: &mut Builder<GzEncoder<&mut Vec<u8>>>) -> Result<()> {
+        if path.exists() {
+            let relative_path = path.strip_prefix(path.parent().unwrap())?;
+            info!("Adding to tarball: {}", relative_path.display());
+            tar.append_path_with_name(path, relative_path)?;
+        }
+        Ok(())
     }
 
     async fn write_artifact_safely(path: &Path, data: &[u8]) -> Result<()> {
@@ -188,31 +216,35 @@ impl TesseractClient {
         }
 
         let tmp_path = path.with_extension(format!("{}.tmp", std::process::id()));
-
         tokio::fs::write(&tmp_path, data).await?;
 
         #[cfg(windows)]
         {
+            use tokio::fs;
             let old_path = path.with_extension(format!("{}.old", std::process::id()));
+            
             if path.exists() {
-                if let Err(e) = tokio::fs::rename(path, &old_path).await {
-                    tokio::fs::remove_file(&tmp_path).await?;
-                    return Err(anyhow::anyhow!(
-                        "Could not replace existing file - it may be in use: {}",
-                        e
-                    ));
+                match fs::rename(path, &old_path).await {
+                    Ok(_) => (),
+                    Err(e) => {
+                        fs::remove_file(&tmp_path).await?;
+                        return Err(anyhow::anyhow!(
+                            "Could not replace existing file - it may be in use: {}",
+                            e
+                        ));
+                    }
                 }
             }
 
-            if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
+            if let Err(e) = fs::rename(&tmp_path, path).await {
                 if old_path.exists() {
-                    let _ = tokio::fs::rename(&old_path, path).await;
+                    let _ = fs::rename(&old_path, path).await;
                 }
                 return Err(anyhow::anyhow!("Failed to move new file into place: {}", e));
             }
 
             if old_path.exists() {
-                let _ = tokio::fs::remove_file(&old_path).await;
+                let _ = fs::remove_file(&old_path).await;
             }
         }
 
@@ -239,7 +271,7 @@ impl TesseractClient {
                 Ok(_) => (),
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        return Ok(());
+                        return Err(anyhow::anyhow!("Server connection closed unexpectedly"));
                     }
                     return Err(e.into());
                 }
@@ -260,22 +292,28 @@ impl TesseractClient {
                     build_progress.build_output.push(output);
                 }
                 BuildResponse::BuildComplete { unit_name, artifacts } => {
+                    build_progress.package_bar.set_message(format!("Building {} - Saving artifacts", unit_name));
+                    
                     for (path, data) in artifacts {
                         let target_path = if let Some(ref target) = self.target {
                             self.workspace_path
                                 .join("target")
                                 .join(target)
                                 .join(if self.release { "release" } else { "debug" })
-                                .join(path)
+                                .join(&path)
                         } else {
                             self.workspace_path
                                 .join("target")
                                 .join(if self.release { "release" } else { "debug" })
-                                .join(path)
+                                .join(&path)
                         };
 
-                        Self::write_artifact_safely(&target_path, &data).await?;
+                        info!("Writing artifact to {}", target_path.display());
+                        Self::write_artifact_safely(&target_path, &data).await
+                            .with_context(|| format!("Failed to write artifact to {}", target_path.display()))?;
+                        info!("Successfully wrote artifact: {}", target_path.display());
                     }
+                    
                     build_progress.package_bar.finish_with_message(
                         format!("{} built successfully", unit_name).green().to_string(),
                     );
@@ -302,11 +340,12 @@ impl TesseractClient {
 
         for package in metadata.packages {
             let manifest_dir = Path::new(&package.manifest_path).parent().unwrap();
+            info!("Processing package {} at {}", package.name, manifest_dir.display());
 
             let mut source_files = Vec::new();
             source_files.push(package.manifest_path.into());
 
-            let workspace_manifest = Path::new(metadata.workspace_root.as_str()).join("Cargo.toml");
+            let workspace_manifest = Path::new(&metadata.workspace_root).join("Cargo.toml");
             if workspace_manifest.exists() {
                 source_files.push(workspace_manifest);
             }
@@ -315,19 +354,25 @@ impl TesseractClient {
                 if target.kind.iter().any(|k| k == "lib" || k == "bin") {
                     let src_path = Path::new(&target.src_path);
                     let src_dir = src_path.parent().unwrap();
-
+                    
+                    info!("Scanning directory: {}", src_dir.display());
+                    
                     for entry in WalkDir::new(src_dir) {
-                        if let Ok(entry) = entry {
-                            if entry.path().extension().map_or(false, |ext| ext == "rs") {
-                                source_files.push(entry.path().to_path_buf());
+                        match entry {
+                            Ok(entry) => {
+                                if entry.path().extension().map_or(false, |ext| ext == "rs") {
+                                    info!("Found source file: {}", entry.path().display());
+                                    source_files.push(entry.path().to_path_buf());
+                                }
                             }
+                            Err(e) => warn!("Error walking directory: {}", e),
                         }
                     }
                 }
             }
 
             let unit = BuildUnit {
-                package_name: package.name,
+                package_name: package.name.clone(),
                 dependencies: package
                     .dependencies
                     .iter()
@@ -357,7 +402,10 @@ impl TesseractClient {
 
         stream.set_nodelay(true)?;
 
-        let tarball = Self::create_tarball(&unit)?;
+        info!("Creating tarball for {}", unit.package_name);
+        let tarball = Self::create_tarball(&unit)
+            .context("Failed to create source tarball")?;
+        info!("Created tarball of {} bytes", tarball.len());
 
         let request = BuildRequest::BuildUnit {
             unit: unit.clone(),
@@ -366,12 +414,21 @@ impl TesseractClient {
             tarball_data: tarball,
         };
 
-        let data = bincode::serialize(&request)?;
-        let len = (data.len() as u32).to_be_bytes();
-        stream.write_all(&len).await?;
-        stream.write_all(&data).await?;
+        info!("Serializing build request");
+        let data = bincode::serialize(&request)
+            .context("Failed to serialize build request")?;
+        info!("Request size: {} bytes", data.len());
 
-        self.handle_build_stream(stream, &unit).await
+        let len = (data.len() as u32).to_be_bytes();
+        stream.write_all(&len).await
+            .context("Failed to send message length")?;
+        stream.write_all(&data).await
+            .context("Failed to send build request")?;
+
+        info!("Request sent, waiting for build stream");
+        self.handle_build_stream(stream, &unit).await?;
+
+        Ok(())
     }
 
     pub async fn build(&self) -> Result<()> {
@@ -384,6 +441,7 @@ impl TesseractClient {
             for attempt in 1..=self.retries {
                 match self.build_unit(unit.clone(), attempt).await {
                     Ok(_) => {
+                        last_error = None;
                         break;
                     }
                     Err(e) => {
@@ -398,8 +456,9 @@ impl TesseractClient {
                     }
                 }
             }
+            
             if let Some(e) = last_error {
-                return Err(e);
+                return Err(e.context(format!("Failed to build {} after {} attempts", unit.package_name, self.retries)));
             }
         }
 
@@ -409,14 +468,19 @@ impl TesseractClient {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = CliArgs::parse();
+    let Cargo::Tesseract(args) = Cargo::parse();
 
-    // Setup logging
     let log_level = if args.debug { Level::DEBUG } else { Level::INFO };
     let subscriber = FmtSubscriber::builder()
         .with_max_level(log_level)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
+
+    info!("Starting Tesseract client");
+    info!(
+        "Server: {}, Release: {}, Target: {:?}",
+        args.server, args.release, args.target
+    );
 
     let client = TesseractClient::new(
         args.server,
