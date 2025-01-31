@@ -1,16 +1,50 @@
-use clap::{Command, Arg};
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use walkdir::WalkDir;
-use std::path::{Path, PathBuf};
-use std::io;
-use std::time::Duration;
-use serde::{Serialize, Deserialize};
-use indicatif::{ProgressBar, ProgressStyle};
-use colored::*;
 use anyhow::{Context, Result};
+use cargo_metadata::MetadataCommand;
+use clap::Parser;
+use colored::*;
+use flate2::{write::GzEncoder, Compression};
+use serde::{Serialize, Deserialize};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::Mutex,
+};
+use tracing::{error, info, warn, Level};
+use tracing_subscriber::{FmtSubscriber};
+use walkdir::WalkDir;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct CliArgs {
+    /// Server address (host:port)
+    #[arg(short, long)]
+    server: String,
+
+    /// Build in release mode
+    #[arg(short, long)]
+    release: bool,
+
+    /// Target triple
+    #[arg(short, long)]
+    target: Option<String>,
+
+    /// Enable debug logging
+    #[arg(short, long)]
+    debug: bool,
+
+    /// Number of retry attempts for failed builds
+    #[arg(short = 'n', long, default_value = "3")]
+    retries: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct BuildUnit {
     package_name: String,
     dependencies: Vec<String>,
@@ -18,7 +52,7 @@ struct BuildUnit {
     artifacts: Vec<PathBuf>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum BuildRequest {
     BuildUnit {
         unit: BuildUnit,
@@ -30,11 +64,16 @@ enum BuildRequest {
         from_unit: String,
         artifact_path: PathBuf,
     },
-    Heartbeat
+    Heartbeat,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum BuildResponse {
+    BuildOutput {
+        unit_name: String,
+        output: String,
+        is_error: bool,
+    },
     BuildComplete {
         unit_name: String,
         artifacts: Vec<(PathBuf, Vec<u8>)>,
@@ -43,275 +82,352 @@ enum BuildResponse {
         unit_name: String,
         error: String,
     },
-    HeartbeatAck
+    HeartbeatAck,
 }
 
-fn should_include_file(path: &Path) -> bool {
-    let ignored_patterns = [
-        ".git", ".gitignore", "target", "node_modules",
-        ".cargo", ".vscode", ".idea", "builds",
-        ".DS_Store", "Thumbs.db", // System files
-        ".exe", ".dll", ".so", ".dylib", // Binaries
-        ".o", ".obj", // Object files
-    ];
+struct BuildProgress {
+    package_bar: ProgressBar,
+    build_output: Vec<String>,
+}
 
-    // Check if file exists and is regular file
-    if !path.is_file() {
-        return false;
+struct TesseractClient {
+    server_addr: String,
+    release: bool,
+    target: Option<String>,
+    workspace_path: PathBuf,
+    progress: Arc<Mutex<HashMap<String, BuildProgress>>>,
+    multi_progress: MultiProgress,
+    retries: u32,
+}
+
+impl TesseractClient {
+    fn new(
+        server_addr: String,
+        release: bool,
+        target: Option<String>,
+        retries: u32,
+    ) -> Result<Self> {
+        let workspace_path = std::env::current_dir()?;
+        Ok(Self {
+            server_addr,
+            release,
+            target,
+            workspace_path,
+            progress: Arc::new(Mutex::new(HashMap::new())),
+            multi_progress: MultiProgress::new(),
+            retries,
+        })
     }
 
-    // Convert path to string for pattern matching
-    let path_str = path.to_string_lossy();
-
-    // Skip files larger than 50MB
-    if path.metadata().map(|m| m.len() > 50_000_000).unwrap_or(true) {
-        return false;
+    fn create_progress_bar(&self, msg: &str) -> ProgressBar {
+        let pb = self.multi_progress.add(ProgressBar::new(100));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{msg} {bar:40.cyan/blue} {spinner}")
+                .unwrap()
+                .progress_chars("=> "),
+        );
+        pb.set_message(msg.to_string());
+        pb
     }
 
-    // Check against ignored patterns
-    !ignored_patterns.iter().any(|&pattern| path_str.contains(pattern))
-}
+    fn create_tarball(unit: &BuildUnit) -> Result<Vec<u8>> {
+        let root_dir = unit.source_files
+            .iter()
+            .find_map(|path| {
+                let mut current = path.parent()?;
+                while let Some(parent) = current.parent() {
+                    if current.join("Cargo.toml").exists() {
+                        return Some(current.to_path_buf());
+                    }
+                    current = parent;
+                }
+                None
+            })
+            .ok_or_else(|| anyhow::anyhow!("Could not find directory containing Cargo.toml"))?;
 
-fn create_progress_bar(len: u64, message: &str) -> ProgressBar {
-    let pb = ProgressBar::new(len);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{msg} {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes}")
-        .unwrap()
-        .progress_chars("#>-"));
-    pb.set_message(message.to_string());
-    pb
-}
+        let mut tarball = Vec::new();
+        let encoder = GzEncoder::new(&mut tarball, Compression::default());
+        let mut tar = tar::Builder::new(encoder);
 
-async fn send_request(
-    stream: &mut TcpStream,
-    request: &BuildRequest,
-    timeout: Duration,
-) -> Result<BuildResponse> {
-    tokio::time::timeout(timeout, async {
-        let data = bincode::serialize(request)
-            .context("Failed to serialize request")?;
+        // Add Cargo.toml and Cargo.lock from root
+        let mut add_file = |path: &Path| -> Result<()> {
+            if path.exists() {
+                let relative_path = path.strip_prefix(&root_dir)?;
+                tar.append_path_with_name(path, relative_path)?;
+            }
+            Ok(())
+        };
+
+        add_file(&root_dir.join("Cargo.toml"))?;
+        add_file(&root_dir.join("Cargo.lock"))?;
+
+        // Add source files
+        for source_path in &unit.source_files {
+            add_file(source_path)?;
+        }
+
+        // Add workspace files if they exist
+        let workspace_root = root_dir.ancestors()
+            .find(|dir| dir.join("Cargo.toml").exists())
+            .unwrap_or(&root_dir);
+
+        if workspace_root != &root_dir {
+            add_file(&workspace_root.join("Cargo.toml"))?;
+            add_file(&workspace_root.join("Cargo.lock"))?;
+        }
+
+        tar.finish()?;
+        drop(tar.into_inner()?);
+        Ok(tarball)
+    }
+
+    async fn write_artifact_safely(path: &Path, data: &[u8]) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let tmp_path = path.with_extension(format!("{}.tmp", std::process::id()));
+
+        tokio::fs::write(&tmp_path, data).await?;
+
+        #[cfg(windows)]
+        {
+            let old_path = path.with_extension(format!("{}.old", std::process::id()));
+            if path.exists() {
+                if let Err(e) = tokio::fs::rename(path, &old_path).await {
+                    tokio::fs::remove_file(&tmp_path).await?;
+                    return Err(anyhow::anyhow!(
+                        "Could not replace existing file - it may be in use: {}",
+                        e
+                    ));
+                }
+            }
+
+            if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
+                if old_path.exists() {
+                    let _ = tokio::fs::rename(&old_path, path).await;
+                }
+                return Err(anyhow::anyhow!("Failed to move new file into place: {}", e));
+            }
+
+            if old_path.exists() {
+                let _ = tokio::fs::remove_file(&old_path).await;
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            tokio::fs::rename(&tmp_path, path).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_build_stream(&self, mut stream: TcpStream, unit: &BuildUnit) -> Result<()> {
+        let mut progress = self.progress.lock().await;
+        let build_progress = progress
+            .entry(unit.package_name.clone())
+            .or_insert_with(|| BuildProgress {
+                package_bar: self.create_progress_bar(&format!("Building {}", unit.package_name)),
+                build_output: Vec::new(),
+            });
+
+        loop {
+            let mut len_buf = [0u8; 4];
+            match stream.read_exact(&mut len_buf).await {
+                Ok(_) => (),
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        return Ok(());
+                    }
+                    return Err(e.into());
+                }
+            }
+
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0; len];
+            stream.read_exact(&mut buf).await?;
+
+            match bincode::deserialize(&buf)? {
+                BuildResponse::BuildOutput { output, is_error, .. } => {
+                    let output = if is_error {
+                        output.red().to_string()
+                    } else {
+                        output.green().to_string()
+                    };
+                    println!("{}", output);
+                    build_progress.build_output.push(output);
+                }
+                BuildResponse::BuildComplete { unit_name, artifacts } => {
+                    for (path, data) in artifacts {
+                        let target_path = if let Some(ref target) = self.target {
+                            self.workspace_path
+                                .join("target")
+                                .join(target)
+                                .join(if self.release { "release" } else { "debug" })
+                                .join(path)
+                        } else {
+                            self.workspace_path
+                                .join("target")
+                                .join(if self.release { "release" } else { "debug" })
+                                .join(path)
+                        };
+
+                        Self::write_artifact_safely(&target_path, &data).await?;
+                    }
+                    build_progress.package_bar.finish_with_message(
+                        format!("{} built successfully", unit_name).green().to_string(),
+                    );
+                    return Ok(());
+                }
+                BuildResponse::BuildError { unit_name, error } => {
+                    build_progress.package_bar.finish_with_message(
+                        format!("{} build failed", unit_name).red().to_string(),
+                    );
+                    return Err(anyhow::anyhow!("Build failed: {}", error));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn discover_build_units(&self) -> Result<Vec<BuildUnit>> {
+        let metadata = MetadataCommand::new()
+            .current_dir(&self.workspace_path)
+            .no_deps()
+            .exec()?;
+
+        let mut units = Vec::new();
+
+        for package in metadata.packages {
+            let manifest_dir = Path::new(&package.manifest_path).parent().unwrap();
+
+            let mut source_files = Vec::new();
+            source_files.push(package.manifest_path.into());
+
+            let workspace_manifest = Path::new(metadata.workspace_root.as_str()).join("Cargo.toml");
+            if workspace_manifest.exists() {
+                source_files.push(workspace_manifest);
+            }
+
+            for target in &package.targets {
+                if target.kind.iter().any(|k| k == "lib" || k == "bin") {
+                    let src_path = Path::new(&target.src_path);
+                    let src_dir = src_path.parent().unwrap();
+
+                    for entry in WalkDir::new(src_dir) {
+                        if let Ok(entry) = entry {
+                            if entry.path().extension().map_or(false, |ext| ext == "rs") {
+                                source_files.push(entry.path().to_path_buf());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let unit = BuildUnit {
+                package_name: package.name,
+                dependencies: package
+                    .dependencies
+                    .iter()
+                    .map(|d| d.name.clone())
+                    .collect(),
+                source_files,
+                artifacts: package
+                    .targets
+                    .iter()
+                    .filter(|t| t.kind.iter().any(|k| k == "lib" || k == "bin"))
+                    .map(|t| PathBuf::from(&t.name))
+                    .collect(),
+            };
+
+            units.push(unit);
+        }
+
+        Ok(units)
+    }
+
+    async fn build_unit(&self, unit: BuildUnit, attempt: u32) -> Result<()> {
+        info!("Building package {} (attempt {})", unit.package_name, attempt);
+
+        let mut stream = TcpStream::connect(&self.server_addr)
+            .await
+            .context("Failed to connect to build server")?;
+
+        stream.set_nodelay(true)?;
+
+        let tarball = Self::create_tarball(&unit)?;
+
+        let request = BuildRequest::BuildUnit {
+            unit: unit.clone(),
+            release: self.release,
+            target: self.target.clone(),
+            tarball_data: tarball,
+        };
+
+        let data = bincode::serialize(&request)?;
         let len = (data.len() as u32).to_be_bytes();
-        
         stream.write_all(&len).await?;
         stream.write_all(&data).await?;
 
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-
-        let mut buf = vec![0; len];
-        stream.read_exact(&mut buf).await?;
-        
-        bincode::deserialize(&buf)
-            .context("Failed to deserialize response")
-    })
-    .await
-    .context("Request timed out")?
-}
-
-fn create_tarball(files: &[PathBuf], current_dir: &Path) -> Result<Vec<u8>> {
-    let mut tarball = Vec::new();
-    let enc = flate2::write::GzEncoder::new(&mut tarball, flate2::Compression::default());
-    let mut tar = tar::Builder::new(enc);
-
-    for path in files {
-        let relative_path = path.strip_prefix(current_dir)
-            .with_context(|| format!("Failed to strip prefix from {}", path.display()))?;
-            
-        tar.append_path_with_name(path, relative_path)
-            .with_context(|| format!("Failed to add {} to tarball", path.display()))?;
+        self.handle_build_stream(stream, &unit).await
     }
 
-    tar.finish().context("Failed to finish tar archive")?;
-    drop(tar); // Explicitly drop tar to release the borrow on tarball
-    Ok(tarball)
+    pub async fn build(&self) -> Result<()> {
+        info!("Discovering build units in workspace...");
+        let units = self.discover_build_units()?;
+        info!("Found {} build units", units.len());
+
+        for unit in units {
+            let mut last_error = None;
+            for attempt in 1..=self.retries {
+                match self.build_unit(unit.clone(), attempt).await {
+                    Ok(_) => {
+                        break;
+                    }
+                    Err(e) => {
+                        last_error = Some(e);
+                        if attempt < self.retries {
+                            warn!(
+                                "Build attempt {} failed for {}, retrying in 2 seconds...",
+                                attempt, unit.package_name
+                            );
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+            }
+            if let Some(e) = last_error {
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let matches = Command::new("cargo-tess")
-        .bin_name("cargo")
-        .subcommand(
-            Command::new("tess")
-                .about("Distributed Rust build system")
-                .arg(Arg::new("node")
-                    .short('n')
-                    .long("node")
-                    .help("Address of any node in cluster (host:port)")
-                    .default_value("localhost:9876"))
-                .arg(Arg::new("release")
-                    .long("release")
-                    .help("Build with release profile"))
-                .arg(Arg::new("target")
-                    .long("target")
-                    .help("Build for specific target triple"))
-                .arg(Arg::new("verbose")
-                    .short('v')
-                    .long("verbose")
-                    .help("Enable verbose logging"))
-                .arg(Arg::new("timeout")
-                    .short('t')
-                    .long("timeout")
-                    .help("Timeout in seconds")
-                    .default_value("600")))
-        .get_matches();
+    let args = CliArgs::parse();
 
-    let Some(matches) = matches.subcommand_matches("tess") else {
-        println!("Use 'cargo tess' to run the distributed build");
-        return Ok(());
-    };
+    // Setup logging
+    let log_level = if args.debug { Level::DEBUG } else { Level::INFO };
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(log_level)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
 
-    let node = matches.get_one::<String>("node").unwrap();
-    let release = matches.contains_id("release");
-    let target = matches.get_one::<String>("target").cloned();
-    let verbose = matches.contains_id("verbose");
-    let timeout = matches
-        .get_one::<String>("timeout")
-        .unwrap()
-        .parse::<u64>()
-        .context("Invalid timeout value")?;
+    let client = TesseractClient::new(
+        args.server,
+        args.release,
+        args.target,
+        args.retries,
+    )?;
 
-    println!("{}", "🔌 Connecting to build cluster...".green());
-    let mut stream = TcpStream::connect(node)
-        .await
-        .context("Failed to connect to build node")?;
-    stream.set_nodelay(true)?;
-
-    // Initial heartbeat check
-    let heartbeat = BuildRequest::Heartbeat;
-    let response = send_request(&mut stream, &heartbeat, Duration::from_secs(10)).await?;
-    
-    match response {
-        BuildResponse::HeartbeatAck => {
-            if verbose {
-                println!("Successfully connected to build cluster");
-            }
-        },
-        _ => return Err(anyhow::anyhow!("Invalid response from build cluster"))
-    }
-
-    // Read cargo metadata
-    let metadata = cargo_metadata::MetadataCommand::new()
-        .exec()
-        .context("Failed to read Cargo metadata")?;
-        
-    let package = metadata.root_package()
-        .context("No package found in workspace")?;
-
-    // Collect source files
-    let current_dir = std::env::current_dir().context("Failed to get current directory")?;
-    
-    let mut source_files: Vec<_> = WalkDir::new(&current_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path().to_path_buf())
-        .filter(|path| should_include_file(path))
-        .collect();
-
-    // Always include Cargo.toml and Cargo.lock
-    let cargo_toml = current_dir.join("Cargo.toml");
-    let cargo_lock = current_dir.join("Cargo.lock");
-    
-    if cargo_toml.exists() {
-        source_files.push(cargo_toml);
-    }
-    if cargo_lock.exists() {
-        source_files.push(cargo_lock);
-    }
-
-    if source_files.is_empty() {
-        return Err(anyhow::anyhow!("No source files found"));
-    }
-
-    if verbose {
-        println!("Found {} source files", source_files.len());
-        for file in &source_files {
-            println!("  {}", file.display());
-        }
-        if let Some(target) = &target {
-            println!("Building for target: {}", target);
-        }
-    }
-
-    // Create progress bar for tarball creation
-    let total_size: u64 = source_files
-        .iter()
-        .filter_map(|p| p.metadata().ok())
-        .map(|m| m.len())
-        .sum();
-    
-    let pb = create_progress_bar(total_size, "Preparing source files");
-
-    // Create tarball
-    let tarball_data = create_tarball(&source_files, &current_dir)?;
-    pb.finish_with_message("✨ Source files prepared");
-
-    // Prepare build unit
-    let unit = BuildUnit {
-        package_name: package.name.clone(),
-        dependencies: package.dependencies.iter().map(|d| d.name.clone()).collect(),
-        source_files,
-        artifacts: package.targets
-            .iter()
-            .filter(|t| t.kind.iter().any(|k| k == "bin" || k == "lib"))
-            .map(|t| PathBuf::from(&t.name))
-            .collect(),
-    };
-
-    println!("{}", "🚀 Starting distributed build...".green());
-    let request = BuildRequest::BuildUnit {
-        unit,
-        release,
-        target: target.clone(),
-        tarball_data,
-    };
-
-    let response = send_request(
-        &mut stream,
-        &request,
-        Duration::from_secs(timeout),
-    ).await?;
-
-    match response {
-        BuildResponse::BuildComplete { unit_name, artifacts } => {
-            println!("{}", "✅ Build successful".green());
-            println!("{}", "📥 Downloading artifacts...".yellow());
-
-            let total_size: u64 = artifacts.iter().map(|(_, data)| data.len() as u64).sum();
-            let pb = create_progress_bar(total_size, "Downloading artifacts");
-
-            let mut target_dir = current_dir.join("target");
-            if let Some(target_triple) = &target {
-                target_dir = target_dir.join(target_triple);
-            }
-            target_dir = target_dir.join(if release { "release" } else { "debug" });
-
-            tokio::fs::create_dir_all(&target_dir).await?;
-
-            for (path, data) in artifacts {
-                let target_path = target_dir.join(path);
-                
-                if let Some(parent) = target_path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                
-                pb.inc(data.len() as u64);
-
-                tokio::fs::write(&target_path, data).await
-                    .with_context(|| format!("Failed to write artifact to {}", target_path.display()))?;
-            }
-
-            pb.finish_with_message("✨ Artifacts downloaded successfully!");
-            println!("{}", "Build process complete! 🎉".green());
-        },
-        BuildResponse::BuildError { unit_name, error } => {
-            eprintln!("{}: {} - {}", "Build Error".red(), unit_name, error);
-            std::process::exit(1);
-        },
-        _ => {
-            eprintln!("Unexpected response from build cluster");
-            std::process::exit(1);
-        }
+    if let Err(e) = client.build().await {
+        error!("Build failed: {:#}", e);
+        std::process::exit(1);
     }
 
     Ok(())
