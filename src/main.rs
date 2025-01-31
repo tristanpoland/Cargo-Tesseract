@@ -141,84 +141,124 @@ impl TesseractClient {
         pb
     }
 
-    fn create_tarball(unit: &BuildUnit) -> Result<Vec<u8>> {
-        // Find both workspace root and package root
-        let workspace_root = unit.source_files
-            .iter()
-            .find_map(|path| {
-                path.ancestors()
-                    .find(|dir| dir.join("Cargo.toml").exists())
-                    .map(|dir| dir.to_path_buf())
-            })
-            .ok_or_else(|| anyhow::anyhow!("Could not find workspace root"))?;
+    fn read_gitignore(path: &Path) -> Vec<String> {
+        let mut patterns = vec![
+            ".git".to_string(),
+            "target".to_string(),
+            "Cargo.lock".to_string(),
+        ];
 
-        let package_root = unit.source_files
-            .iter()
-            .find_map(|path| {
-                let mut current = path.parent()?;
-                while let Some(parent) = current.parent() {
-                    if current.join("Cargo.toml").exists() {
-                        return Some(current.to_path_buf());
+        if let Ok(content) = std::fs::read_to_string(path.join(".gitignore")) {
+            patterns.extend(content
+                .lines()
+                .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+                .map(|line| line.trim().to_string()));
+        }
+        patterns
+    }
+
+    fn is_ignored(path: &Path, workspace_root: &Path, ignore_patterns: &[String]) -> bool {
+        let relative_path = path.strip_prefix(workspace_root)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+        for pattern in ignore_patterns {
+            let pattern = pattern.trim_matches('/');
+            if pattern.contains('*') {
+                let regex_pattern = pattern
+                    .replace(".", "\\.")
+                    .replace("**/", "(.*/)?")
+                    .replace("*", "[^/]*");
+                if let Ok(regex) = regex::Regex::new(&format!("^{}$", regex_pattern)) {
+                    if regex.is_match(&relative_path) {
+                        return true;
                     }
-                    current = parent;
+                }
+            } else if relative_path.contains(pattern) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn create_tarball(unit: &BuildUnit) -> Result<Vec<u8>> {
+        let all_manifests: Vec<_> = unit.source_files.iter()
+            .filter(|p| p.ends_with("Cargo.toml"))
+            .collect();
+
+        // Find workspace root
+        let workspace_root = all_manifests.iter()
+            .filter_map(|p| p.parent())
+            .min_by_key(|p| p.components().count())
+            .ok_or_else(|| anyhow::anyhow!("Could not find workspace root"))?
+            .to_path_buf();
+
+        // Find package root by parsing Cargo.toml files
+        let package_root = all_manifests.iter()
+            .filter_map(|p| {
+                let dir = p.parent()?;
+                if let Ok(content) = std::fs::read_to_string(p) {
+                    if content.contains(&format!("name = \"{}\"", unit.package_name)) {
+                        return Some(dir.to_path_buf());
+                    }
                 }
                 None
             })
+            .next()
             .ok_or_else(|| anyhow::anyhow!("Could not find package root"))?;
 
         info!("Creating tarball:");
         info!("Workspace root: {}", workspace_root.display());
         info!("Package root: {}", package_root.display());
 
+        // Read gitignore patterns
+        let ignore_patterns = Self::read_gitignore(&workspace_root);
+
+        // Create temporary directory for staging
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path = temp_dir.path();
+
+        // Copy workspace files
+        for entry in walkdir::WalkDir::new(&workspace_root) {
+            let entry = entry?;
+            let path = entry.path();
+
+            if Self::is_ignored(path, &workspace_root, &ignore_patterns) {
+                continue;
+            }
+
+            let relative_path = path.strip_prefix(&workspace_root)?;
+            let dest_path = temp_path.join(relative_path);
+
+            if entry.file_type().is_dir() {
+                std::fs::create_dir_all(&dest_path)?;
+            } else {
+                if let Some(parent) = dest_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(path, &dest_path)?;
+                info!("Copied: {} -> {}", relative_path.display(), dest_path.display());
+            }
+        }
+
+        // List final directory structure
+        info!("Final directory structure:");
+        for entry in walkdir::WalkDir::new(temp_path) {
+            if let Ok(entry) = entry {
+                if let Ok(relative) = entry.path().strip_prefix(temp_path) {
+                    info!("  {}", relative.display());
+                }
+            }
+        }
+
+        // Create tarball
         let mut tarball = Vec::new();
         let encoder = GzEncoder::new(&mut tarball, Compression::default());
         let mut tar = Builder::new(encoder);
-
-        // Helper to add files with correct relative paths
-        let mut add_file = |path: &Path| -> Result<()> {
-            if !path.exists() {
-                return Ok(());
-            }
-
-            // Calculate relative path from workspace root
-            let relative_path = if path.starts_with(&workspace_root) {
-                path.strip_prefix(&workspace_root)?
-            } else {
-                path.file_name()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?
-                    .as_ref()
-            };
-
-            info!("Adding file: {} as {}", path.display(), relative_path.display());
-            tar.append_path_with_name(path, relative_path)?;
-            Ok(())
-        };
-
-        // Add workspace files
-        add_file(&workspace_root.join("Cargo.toml"))?;
-        add_file(&workspace_root.join("Cargo.lock"))?;
-
-        // Add package files
-        let package_dir_name = package_root.file_name()
-            .ok_or_else(|| anyhow::anyhow!("Invalid package directory name"))?;
-        
-        // Add package manifest with correct relative path
-        let package_relative = package_root.strip_prefix(&workspace_root)?;
-        add_file(&package_root.join("Cargo.toml"))?;
-
-        // Add all source files
-        for source_path in &unit.source_files {
-            add_file(source_path)?;
-        }
-
-        // Add .cargo/config.toml if it exists
-        let cargo_config = workspace_root.join(".cargo").join("config.toml");
-        if cargo_config.exists() {
-            add_file(&cargo_config)?;
-        }
-
+        tar.append_dir_all(".", temp_path)?;
         tar.finish()?;
         drop(tar);
+
         Ok(tarball)
     }
 
